@@ -1,0 +1,11 @@
+{
+  "name": "local-json-diff",
+  "version": "1.0.0",
+  "description": "Local structured JSON diff, patch and three-way merge. No database, no cloud, no external services.",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
+  "license": "MIT"
+}

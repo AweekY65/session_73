@@ -1,92 +1,93 @@
-# Local DPLL SAT Solver
+# local-json-diff
 
-一个完全本地、自包含的 SAT 求解器。所有 CNF 输入、求解状态、模型和测试数据只存在于本地文件或内存中；不调用 Z3、MiniSat、云求解服务或任何外部服务，核心算法（DPLL）完全由本项目自行实现，仅使用 Python 标准库。
+本地结构化 JSON **Diff / Patch / 三方 Merge** 工具。纯 Node.js（>= 18，推荐 22）实现，零第三方依赖；所有文档、patch、冲突记录只存在于本地文件或内存中，不使用数据库、云协作文档服务或任何外部服务。
 
-## 项目结构
+## 功能概览
 
-- `sat_solver/dimacs.py` — 严格的 DIMACS CNF 解析器
-- `sat_solver/dpll.py` — DPLL 求解核心（unit propagation、pure literal elimination、分支启发式、统计）
-- `sat_solver/__main__.py` — 命令行入口
-- `tests/test_sat_solver.py` — 自动化测试（含穷举 oracle）
+- `diff(a, b)`：生成 JSON-Patch 风格补丁，`apply(a, patch).doc` 精确等于 `b`。
+- `apply(doc, patch)`：应用补丁，返回 `{ doc, rollback }`，不修改输入文档。
+- `invertPatch(patch)`：不执行即可生成逆向补丁（要求 remove/replace 携带 `prev`，`diff()` 生成的补丁自带）。
+- `merge(base, left, right)`：三方合并，返回 `{ doc, conflicts }`。
+- 支持 object 属性新增 / 删除 / 替换，array 元素插入 / 删除 / 修改。
+- 应用补丁时校验路径存在性、容器类型与操作合法性，抛 `PatchError`（`code` 为 `PATH_NOT_FOUND` / `TYPE_MISMATCH` / `INVALID_OP`）。
 
-## DPLL 流程
+## 路径格式
 
-`solve(nvars, clauses)` 的执行流程：
+补丁中的 `path` 使用 **JSON Pointer（RFC 6901）**：
 
-1. **预处理**：丢弃 tautology clause（同时含 `x` 与 `¬x`，恒真）；重复 literal 由集合表示自然去重；空 clause 直接判定 UNSAT。
-2. **Unit propagation（单元传播）**：反复找出长度为 1 的 clause，将其唯一 literal 赋真并化简公式，直到不动点；若化简产生空 clause 则当前分支冲突。每次赋值计入 `propagations`。
-3. **Pure literal elimination（纯文字消除）**：在剩余公式中只以单一极性出现的变量直接按该极性赋值并化简，随后回到第 2 步。每次赋值计入 `pure_literals`。
-4. **变量选择（分支启发式）**：采用 Jeroslow–Wang 单边启发式——每个 literal 的得分为其出现的所有 clause 的 `2^-len(clause)` 之和；选择两极性得分总和最大的变量，并以得分较高的极性作为第一分支。每次分支计入 `decisions`。
-5. **回溯**：第一分支失败（子树返回 UNSAT）时撤销该赋值、尝试相反极性；两个分支都失败则向上返回冲突。每次分支失败计入 `backtracks`。
+- 段与段之间以 `/` 分隔，空字符串 `""` 表示文档根（根节点只允许 `replace`）。
+- object 的 key 原样作为路径段；key 中的 `~` 转义为 `~0`，`/` 转义为 `~1`（如 key `a/b` 的路径为 `/a~1b`）。
+- array 下标为十进制数字（`0`、`1`、`2`…），必须落在合法范围内；`add` 允许下标等于数组长度（追加到末尾）。
 
-求解保证终止（每次决策固定一个变量），UNSAT 结论来自完整的搜索树穷尽，不依赖任何超时猜测。
+## Patch 格式
 
-## 退化输入的确定语义
-
-| 输入 | 语义 |
-| --- | --- |
-| 空公式（0 个 clause） | SAT，任意赋值都是模型；未受约束的变量默认赋 `False`，模型总是完整可直接验证 |
-| 空 clause | UNSAT（根节点冲突） |
-| clause 内重复 literal | 集合语义，自动去重 |
-| tautology clause（含 `x` 与 `¬x`） | 恒真，加载时丢弃 |
-
-SAT 结果通过 `verify(clauses, model)` 可再次逐条验证所有 clause。
-
-## DIMACS 输入格式
-
-```
-c 注释行（可出现在任意位置）
-p cnf <nvars> <nclauses>
-1 -2 0
-2 3 0
-%
+```json
+[
+  { "op": "add",     "path": "/deps/c",  "value": "3.0" },
+  { "op": "remove",  "path": "/deps/a",  "prev": "1.0" },
+  { "op": "replace", "path": "/name",    "value": "app2", "prev": "app" }
+]
 ```
 
-严格校验（违反即抛出 `DimacsError`）：
+- `add`：object 新增/覆盖 key，或向 array 指定下标插入元素。
+- `remove`：删除存在的 key / 数组元素；`prev` 记录被删除的旧值。
+- `replace`：替换存在的值；`prev` 记录旧值。
+- `prev` 即 rollback 信息：`remove`/`replace` 必带，`diff()` 生成的补丁自动包含。
 
-- 必须有且仅有一个 `p cnf` 头，且出现在任何 clause 之前；
-- `nvars`、`nclauses` 必须是非负整数；
-- 每个 literal `l` 满足 `1 <= |l| <= nvars`；
-- 每个 clause 必须以 `0` 结尾（允许跨行）；
-- clause 数量必须与头部声明一致；
-- 可选的 `%` 结束标记必须独占一行，其后不允许出现任何非空内容。
+## Diff 策略
 
-## 使用方法
+- **Object**：按 key 集合比较，与 key 的输入顺序无关——仅调整 key 顺序不会产生任何 diff。key 按字典序遍历，保证同一输入永远生成同一份补丁。
+- **Array**：以“元素深相等”为基础做 LCS 对齐；对齐锚点之间的未匹配区段按位置配对：
+  - 配对的元素生成原地修改（`replace` 或嵌套 diff）；
+  - 多出的旧元素生成 `remove`，多出的新元素生成 `add`。
+- **其他**（原始值变化、类型变化）：单个 `replace`。
+
+### 数组顺序变化规则
+
+数组是**有序**的：元素移动位置属于真实修改。重排数组会对被移动的元素生成 `remove` + `add`（LCS 保持最长稳定子序列不动），例如 `[1,2,3] → [3,1,2]` 生成 `add /0 = 3` 与 `remove /3`。
+
+## 三方 Merge 规则
+
+`merge(base, left, right)` 递归比较三方：
+
+1. 仅一方修改（或双方修改结果相同）→ 自动采用，无冲突。
+2. Object 按 key 递归合并：一方删除、另一方未动 → 删除；一方删除、另一方修改 → `delete-vs-modify` 冲突。
+3. 双方各自新增同一个 key 但值不同 → `create-vs-create` 冲突。
+4. Array：三方长度一致时按下标逐元素合并；双方都改变了数组结构（长度不一致）→ 整个数组报 `array-structure-conflict` 冲突；仅一方改变结构 → 自动采用该方。
+5. 其他双方不兼容修改（含类型变化）→ `incompatible-modification` 冲突。
+
+冲突记录格式：`{ path, reason, base, left, right }`。冲突路径在合并结果中**保留 base 值**（base 不存在该路径时保留 left 值），保证结果确定性。
+
+## 使用
+
+### 库
+
+```js
+import { diff, apply, invertPatch, merge } from './src/index.js';
+
+const patch = diff(a, b);
+const { doc, rollback } = apply(a, patch); // doc 深等于 b
+const restored = apply(doc, rollback).doc; // 还原为 a
+const inverse = invertPatch(patch);        // 不执行也可得到逆向补丁
+const { doc: merged, conflicts } = merge(base, left, right);
+```
+
+### CLI
 
 ```bash
-python3 -m sat_solver <file.cnf>
+node cli.js diff   a.json b.json patch.json        # 生成补丁
+node cli.js apply  a.json patch.json out.json      # 应用补丁（stderr 打印 rollback 信息）
+node cli.js invert patch.json inverse.json         # 生成逆向补丁
+node cli.js merge  base.json left.json right.json merged.json
+# merge 有冲突时退出码为 1，冲突详情打印到 stderr
 ```
 
-输出示例：
+省略输出文件参数时结果打印到 stdout。
 
-```
-SAT
-stats: decisions=1 propagations=2 pure_literals=0 backtracks=0
-v 1 -2 3 0
-```
-
-退出码：`0` = SAT，`1` = UNSAT，`2` = 输入/解析错误。
-
-库用法：
-
-```python
-from sat_solver import parse_dimacs_file, solve, verify
-
-nvars, clauses = parse_dimacs_file("example.cnf")
-result = solve(nvars, clauses)
-print(result.status)          # "SAT" 或 "UNSAT"
-print(result.stats)           # decisions / propagations / pure_literals / backtracks
-if result.satisfiable:
-    assert verify(clauses, result.model)
-```
-
-## 运行测试
-
-所有测试直接在终端执行：
+## 测试
 
 ```bash
-cd /mnt2/zjh/code/Goleta/session_73/b
-python3 -m unittest discover -s tests -v
+npm test          # 等价于 node --test test/*.test.js
 ```
 
-测试覆盖：SAT / UNSAT 基本用例、unit propagation 链、pure literal elimination、深度回溯（鸽笼原理 PHP(4,3)）、DIMACS 各类格式错误、空公式 / 空 clause / 重复 literal / tautology 的退化语义，以及 300 个随机小公式与穷举 oracle 的对拍验证。
+测试全部在终端运行（TAP 输出），覆盖：嵌套对象 diff、数组插入/删除/修改/重排、key 顺序无关性、RFC 6901 转义、非法补丁（路径不存在 / 类型不匹配 / 非法操作）、apply 不修改输入、rollback 与 invertPatch 还原、无冲突 merge、各类三方冲突、复杂文档 round-trip 等。
